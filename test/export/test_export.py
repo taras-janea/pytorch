@@ -953,8 +953,8 @@ graph():
                 # catch concrete inequality
                 with self.assertRaisesRegex(
                     error_type,
-                    "Real tensor propagation found a mismatch between fake shape 8 and real shape 4 "
-                    "at dimension 0"
+                    "Real tensor propagation found a size mismatch between fake shape 8 and real shape 4, "
+                    "at output index 0, dimension 0 for func: mylib.foo.default"
                 ):
                     export(
                         M(),
@@ -965,8 +965,8 @@ graph():
                 d1 = Dim("d1", min=8)
                 with self.assertRaisesRegex(
                     error_type,
-                    "Real tensor propagation found a mismatch between fake shape s1 and real shape 4 "
-                    "at dimension 0 for func: mylib.foo.default"
+                    "Real tensor propagation found a size mismatch between fake shape s1 and real shape 4, "
+                    "at output index 0, dimension 0 for func: mylib.foo.default"
                 ):
                     export(
                         M(),
@@ -976,17 +976,6 @@ graph():
                             "b": (d0, d1),
                         },
                     )
-                # but not if ranges can't differentiate
-                d0 = Dim("d0")
-                d1 = Dim("d1")
-                export(
-                    M(),
-                    (torch.randn(4, 8), torch.randn(4, 8)),
-                    dynamic_shapes={
-                        "a": (d0, d1),
-                        "b": (d0, d1),
-                    },
-                )
 
     @testing.expectedFailureTrainingIRToRunDecompNonStrict  # TODO(pianpwk): user_output signature
     def test_real_tensor_for_max_op(self):

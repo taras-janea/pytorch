@@ -522,8 +522,8 @@ class CppGemmTemplate(CppTemplate):
             # thread and cache blockings are determined at runtime for dynamic shapes
             return
         log.debug(
-            f"Cache blocking: {self.cache_blocking(self.num_threads)}"
-        )  # noqa: G004
+            f"Cache blocking: {self.cache_blocking(self.num_threads)}"  # noqa: G004
+        )
         thread_blocking = self.thread_blocking(self.num_threads)
         log.debug(f"Thread blocking: {thread_blocking}")  # noqa: G004
 
@@ -566,7 +566,7 @@ class CppGemmTemplate(CppTemplate):
         if input_indices is None:
             input_indices = list(range(len(input_nodes)))
 
-        def reorder_and_filter(inputs):
+        def reorder_and_filter(inputs, layout_or_out):
             if has_bias:
                 assert len(input_indices) >= 3
                 # Assume the input order is [inp, x, w] and we reorder it to [x, w, inp]
@@ -578,21 +578,23 @@ class CppGemmTemplate(CppTemplate):
                     inputs[w_idx],
                     inputs[inp_idx],
                     *[inputs[idx] for idx in input_indices[3:]],
-                ]
-            else:
+                ], layout_or_out
+            elif len(inputs) >= 2:
                 assert len(input_indices) >= 2
-                return [inputs[idx] for idx in input_indices]
+                return [inputs[idx] for idx in input_indices], layout_or_out
+            else:
+                return [inputs[0]] * len(input_indices), layout_or_out
 
-        def maybe_to_dense(inputs):
+        def maybe_to_dense(inputs, layout_or_out):
             new_inputs = list(inputs)
             if isinstance(inputs[1], torch.Tensor):
                 W = inputs[1]
                 new_inputs[1] = W.to_dense() if W.is_mkldnn else W
-            return new_inputs
+            return new_inputs, layout_or_out
 
-        def normalize_shapes(inputs):
+        def normalize_shapes(inputs, layout_or_out):
             if not trans_w:
-                return inputs
+                return inputs, layout_or_out
             new_inputs = list(inputs)
             X = inputs[0]
             W = inputs[1]
@@ -617,11 +619,13 @@ class CppGemmTemplate(CppTemplate):
             new_inputs[1] = W
             if B is not None:
                 new_inputs[2] = B
-            return new_inputs
+            return new_inputs, layout_or_out
 
         # TODO(jgong5): decide proper number of threads per problem size
         num_threads = parallel_num_threads()
-        new_inputs = normalize_shapes(maybe_to_dense(reorder_and_filter(input_nodes)))
+        new_inputs, _ = normalize_shapes(
+            *maybe_to_dense(*reorder_and_filter(input_nodes, layout))
+        )
         m, n, k, *_ = mm_args(new_inputs[0], new_inputs[1])
         output_dtype, compute_dtype = get_gemm_template_output_and_compute_dtype(
             new_inputs[0].get_dtype()
@@ -642,28 +646,23 @@ class CppGemmTemplate(CppTemplate):
 
         def preprocessor(inputs, layout):
             return cls.prep_weight(
-                normalize_shapes(maybe_to_dense(reorder_and_filter(inputs))),
-                micro_gemm,
-            ), layout
+                    *normalize_shapes(*maybe_to_dense(*reorder_and_filter(inputs, layout))),
+                    micro_gemm,
+            )
 
         def postprocessor(output):
             if isinstance(output, ir.TensorBox):
                 # prepack the weight as input to the template buffer
                 template_buffer = ir.InputsKernel.unwrap_storage_for_input(output)
                 assert isinstance(template_buffer, ir.CppTemplateBuffer)
-                new_input_nodes = reorder_and_filter(input_nodes)
+                new_input_nodes, _ = reorder_and_filter(input_nodes, layout)
 
                 W_node = new_input_nodes[1]
                 weight_is_constant = W_node.get_name() in V.graph.constants
+
                 if weight_is_constant:
                     W = V.graph.constants[W_node.get_name()]
                     new_input_nodes[1] = W
-                new_input_nodes = cls.prep_weight(
-                    normalize_shapes(maybe_to_dense(new_input_nodes)),
-                    micro_gemm,
-                )
-
-                if weight_is_constant:
                     # By using the new packed weight for the GEMM template, we can prune the
                     # old weight if it has no other users. This saves memory but makes the FX graph
                     # non-retraceable. To support retracing, we can add a repack node to the
@@ -712,6 +711,11 @@ class CppGemmTemplate(CppTemplate):
                             delattr(V.graph.module, node.name)
                             delattr(V.graph.graph.owning_module, node.name)
 
+                new_input_nodes, _ = cls.prep_weight(
+                    *normalize_shapes(*maybe_to_dense(new_input_nodes, layout)),
+                    micro_gemm,
+                )
+
                 W_packed = new_input_nodes[1]
                 if weight_is_constant:
                     W_packed = V.graph.add_tensor_constant(W_packed)
@@ -734,37 +738,38 @@ class CppGemmTemplate(CppTemplate):
         )
 
     @staticmethod
-    def get_padded_size(n, block_n, k, block_weight):
+    def get_padded_size(n, block_n, k, should_block_weight):
         padded_n = get_padded_n(n, block_n)
-        if block_weight:
+        if should_block_weight:
             new_size = [padded_n // block_n, k, block_n]
         else:
             new_size = [k, padded_n]
         return new_size, padded_n
 
     @classmethod
-    def prep_weight(cls, inputs, micro_gemm):
-        block_weight = (
-            cls == CppGemmTemplate or micro_gemm.get_b_layout() != LayoutType.NORMAL
+    def prep_weight(cls, inputs, layout, micro_gemm):
+        should_block_weight = (
+            cls == CppGemmTemplate 
+            or micro_gemm.get_b_layout() != LayoutType.NORMAL
         )
         W = inputs[1]
+        new_inputs = list(inputs)
         if isinstance(W, ir.IRNode):
             k, n = W.get_size()[-2:]
         else:
             k, n = W.shape[-2:]
         _, block_n, _ = micro_gemm.register_blocking
-        new_inputs = list(inputs)
-        new_size, padded_n = cls.get_padded_size(n, block_n, k, block_weight)
+        new_size, padded_n = cls.get_padded_size(n, block_n, k, should_block_weight)
         padding = padded_n - n
 
         if isinstance(W, ir.IRNode):
-            if block_weight:
+            if should_block_weight:
                 W = cls.block_weight_irnode(W, new_size, padding)
             else:
                 W = cls.maybe_pad_weight(W, padding)
             W = cls.pack_vnni_weight_irnode(W, micro_gemm, new_size)
         else:
-            if block_weight:
+            if should_block_weight:
                 W = cls.block_weight_tensor(W, new_size, padding)
             else:
                 W = cls.maybe_pad_weight(W, padding)
@@ -795,7 +800,7 @@ class CppGemmTemplate(CppTemplate):
             else:
                 BCompensate = torch.sum(W.to_dense().to(torch.float), dim=0)  # type: ignore[assignment]
             new_inputs.append(BCompensate)
-        return new_inputs
+        return new_inputs, layout
 
     @staticmethod
     def block_weight_irnode(W, new_size, padding):
@@ -911,7 +916,6 @@ class CppGemmTemplate(CppTemplate):
         template_buffer_node: Optional[ir.CppTemplateBuffer] = None,
         flag_template_buffer_has_other_users: Optional[bool] = None,
         epilogue_nodes: Optional[List[ir.IRNode]] = None,
-        **kwargs,
     ) -> Tuple[Dict[str, Any], List[ir.Buffer]]:
         assert len(self.input_nodes) >= 2
 
@@ -1192,7 +1196,6 @@ class CppGemmTemplate(CppTemplate):
             template_buffer_node=template_buffer_node,
             flag_template_buffer_has_other_users=flag_template_buffer_has_other_users,
             epilogue_nodes=epilogue_nodes,
-            **kwargs,
         )
 
         full_template = MICROKERNEL_DEF + GEMM_STUB + GEMM_TEMPLATE

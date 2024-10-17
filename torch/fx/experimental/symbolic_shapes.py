@@ -3075,7 +3075,7 @@ class ShapeEnv:
         # deferred_runtime_asserts to compute its length
         self.num_deferred_runtime_asserts = 0
         self.log = log
-        self.log.debug("create_env")
+        self.log.info("create_env")
         self.frozen = False
         self.runtime_asserts_frozen = False
         self.dim_constraints: Optional[DimConstraints] = None
@@ -5324,8 +5324,8 @@ class ShapeEnv:
         could then potentially guard on.
 
         Use compute_hint == True if you are trying to compute a non-binding
-        hint for the particular hint values of backed SymInts, e.g., if
-        s0 happens to be 3 this run, compute_hint will subsitute s0 with 3.
+        hint for the particular hint values of backed and unbacked SymInts,
+        e.g., if s0 happens to be 3 this run, compute_hint will subsitute s0 with 3.
         """
 
         # axioms with compute hint NYE
@@ -5334,7 +5334,7 @@ class ShapeEnv:
         expr = self.simplify(expr)
 
         if compute_hint:
-            expr = expr.xreplace(self.var_to_val)
+            expr = expr.xreplace(self.var_to_val).xreplace(self.unbacked_var_to_val)
 
         expr = canonicalize_bool_expr(expr)
 
@@ -5360,16 +5360,7 @@ class ShapeEnv:
             var_ranges = dict(var_to_range)
 
         symbol_info = tuple(
-            (
-                s,
-                var_ranges.get(s),
-                (
-                    self.var_to_val.get(s)
-                    if s in self.var_to_val
-                    else self.unbacked_var_to_val.get(s, None)
-                ),
-                s in self.size_like
-            )
+            (s, var_ranges.get(s), self.var_to_val.get(s), s in self.size_like)
             for s in sorted(fs, key=lambda s: str(s))  # TODO: speed up sort?
         )
 

@@ -47,7 +47,7 @@ def output_alias_each_other(outputs):
     return False
 
 
-def _check_aliasing(context, real_out, real_in, fake_out, fake_in):
+def _check_alias_info(context, real_out, real_in, fake_out, fake_in):
     r_aliasing = outputs_alias_inputs(real_out, real_in)
     f_aliasing = outputs_alias_inputs(fake_out, fake_in)
     assert (
@@ -159,7 +159,7 @@ class CrossRefFakeMode(TorchDispatchMode):
             ), f"{context} mismatch in number of returns {len(f_flat)} != {len(r_flat)}"
 
             if self.check_aliasing:
-                _check_aliasing(
+                _check_alias_info(
                     context, r, (args, kwargs), fake_r, (fake_args, fake_kwargs)
                 )
 

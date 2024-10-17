@@ -1899,6 +1899,8 @@ class FakeTensorMode(TorchDispatchMode):
         def maybe_propagate_real_tensors(fake_out: T) -> T:
             import sympy
 
+            from torch._subclasses.fake_utils import _check_alias_info
+
             log.debug("maybe_propagate_real_tensors %s", func)
 
             def go(t: object, real_t: Tensor) -> None:
@@ -1917,17 +1919,25 @@ class FakeTensorMode(TorchDispatchMode):
                     if isinstance(t.node.expr, sympy.Symbol):
                         assert self.shape_env is not None
                         self.shape_env.set_unbacked_var_to_val(t.node.expr, real_t)
+                    elif (
+                        isinstance(s := t.node.expr, sympy.Eq)
+                        and isinstance(s.lhs, sympy.Symbol)
+                        and s.rhs == 1
+                    ):
+                        assert self.shape_env is not None
+                        self.shape_env.set_unbacked_var_to_val(s, int(real_t))
 
             # use real values to check for potentially mismatched fake/real kernels
             def _fake_real_mismatch(fake: Any, real: Any) -> Optional[bool]:
                 if isinstance(fake, (SymInt, SymFloat)):
                     # symbolic expression, ask ShapeEnv to substitute known backed/unbacked values
                     assert self.shape_env is not None
-                    return (
-                        self.shape_env._maybe_evaluate_static(
-                            sympy.Eq(fake.node.expr, real)
-                        )
-                    ) is sympy.S.false
+                    if not fake.node.expr.free_symbols - self.shape_env.var_to_val.keys() - self.shape_env.unbacked_var_to_val.keys():
+                        return (
+                            self.shape_env._maybe_evaluate_static(
+                                sympy.Eq(fake.node.expr, real), compute_hint=True
+                            )
+                        ) is not sympy.S.true
                 elif isinstance(
                     fake, (int, float, bool)
                 ):  # concrete value, check direct equality
@@ -1950,40 +1960,65 @@ class FakeTensorMode(TorchDispatchMode):
                 else:
                     tree_map_(go, fake_out, real_out)
 
+                # check aliasing info
+                try:
+                    _check_alias_info(
+                        "Real tensor propagation found an aliasing",
+                        (flat_real_out := pytree.tree_leaves(real_out)),
+                        (real_args, real_kwargs),
+                        (flat_fake_out := pytree.tree_leaves(fake_out)),
+                        (args, kwargs),
+                    )
+                except AssertionError as exc:
+                    raise AssertionError(
+                        "Real tensor propagation found an aliasing mismatch between fake output "
+                        f"and real output for func: {func}"
+                    ) from exc
+
                 for i, (_real_out, _fake_out) in enumerate(
-                    zip(pytree.tree_leaves(real_out), pytree.tree_leaves(fake_out))
+                    zip(flat_real_out, flat_fake_out)
                 ):
                     # check both tensors, or compare prim types
                     f_is_ten = isinstance(_fake_out, Tensor)
                     if f_is_ten and not isinstance(_real_out, Tensor):
                         raise AssertionError(
-                            f"Real tensor propagation found a output tensor type mismatch, between fake output with type {type(_fake_out)}, "
-                            f"and real output with type {type(_real_out)}, for func: {func}, at output index {i}"
+                            f"Real tensor propagation found a output tensor type mismatch, "
+                            f"between fake output with type {type(_fake_out)}, and real output "
+                            f"with type {type(_real_out)}, at output index {i}, for func: {func}"
                         )
 
                     if f_is_ten:
                         # check tensor meta
-                        torch._prims.utils.compare_tensor_meta(
-                            _fake_out,
-                            _real_out,
-                            check_sizes=False,  # do our own manual check
-                            check_strides=False,  # skip strides
-                        )
+                        try:
+                            torch._prims.utils.compare_tensor_meta(
+                                _fake_out,
+                                _real_out,
+                                check_sizes=False,  # do our own manual check
+                                check_strides=False,  # skip strides
+                            )
+                        except (AssertionError, RuntimeError) as exc:
+                            raise AssertionError(
+                                f"Real tensor propagation found an output tensor metadata mismatch, "
+                                f"between fake output {_fake_out} and real output {_real_out}, "
+                                f"at output index {i}, for func: {func}"
+                            ) from exc
                         # check symbolic values in sizes
                         for j, (s_fake, s_real) in enumerate(
                             zip(_fake_out.size(), _real_out.size())
                         ):
                             if _fake_real_mismatch(s_fake, s_real):
                                 raise AssertionError(
-                                    f"Real tensor propagation found a size mismatch between fake shape {s_fake} and real shape {s_real}, "
-                                    f"at output index {i}, dimension {j} for func: {func}"
+                                    f"Real tensor propagation found an output size mismatch between "
+                                    f"fake shape {s_fake} and real shape {s_real}, at output "
+                                    f"index {i}, dimension {j} for func: {func}"
                                 )
                     else:
                         # check output values
                         if _fake_real_mismatch(_fake_out, _real_out):
                             raise AssertionError(
-                                f"Real tensor propagation found an output mismatch between fake output value {_fake_out} and real output value {_real_out}, "
-                                f" for func: {func}"
+                                f"Real tensor propagation found an output value mismatch between "
+                                f"fake output value {_fake_out} and real output value {_real_out}, "
+                                f" at output index {i}, for func: {func}"
                             )
 
                 # If a data-dependent op is used in a decomposition, we
